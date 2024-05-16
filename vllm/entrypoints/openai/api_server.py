@@ -1,12 +1,14 @@
 import asyncio
 import importlib
 import inspect
+import json
 import re
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import Optional, Set
 
 import fastapi
+import jasnah
 import uvicorn
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
@@ -20,10 +22,13 @@ import vllm.envs as envs
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.entrypoints.openai.cli_args import make_arg_parser
-from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
-                                              ChatCompletionResponse,
-                                              CompletionRequest,
-                                              EmbeddingRequest, ErrorResponse)
+from vllm.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    CompletionRequest,
+    EmbeddingRequest,
+    ErrorResponse,
+)
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
@@ -68,7 +73,7 @@ def parse_args():
 # Add prometheus asgi middleware to route /metrics requests
 route = Mount("/metrics", make_asgi_app())
 # Workaround for 307 Redirect for /metrics
-route.path_regex = re.compile('^/metrics(?P<path>.*)$')
+route.path_regex = re.compile("^/metrics(?P<path>.*)$")
 app.routes.append(route)
 
 
@@ -98,16 +103,12 @@ async def show_version():
 
 
 @app.post("/v1/chat/completions")
-async def create_chat_completion(request: ChatCompletionRequest,
-                                 raw_request: Request):
-    generator = await openai_serving_chat.create_chat_completion(
-        request, raw_request)
+async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+    generator = await openai_serving_chat.create_chat_completion(request, raw_request)
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(),
-                            status_code=generator.code)
+        return JSONResponse(content=generator.model_dump(), status_code=generator.code)
     if request.stream:
-        return StreamingResponse(content=generator,
-                                 media_type="text/event-stream")
+        return StreamingResponse(content=generator, media_type="text/event-stream")
     else:
         assert isinstance(generator, ChatCompletionResponse)
         return JSONResponse(content=generator.model_dump())
@@ -115,27 +116,70 @@ async def create_chat_completion(request: ChatCompletionRequest,
 
 @app.post("/v1/completions")
 async def create_completion(request: CompletionRequest, raw_request: Request):
-    generator = await openai_serving_completion.create_completion(
-        request, raw_request)
+    generator = await openai_serving_completion.create_completion(request, raw_request)
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(),
-                            status_code=generator.code)
+        return JSONResponse(content=generator.model_dump(), status_code=generator.code)
     if request.stream:
-        return StreamingResponse(content=generator,
-                                 media_type="text/event-stream")
+        return StreamingResponse(content=generator, media_type="text/event-stream")
     else:
         return JSONResponse(content=generator.model_dump())
 
 
 @app.post("/v1/embeddings")
 async def create_embedding(request: EmbeddingRequest, raw_request: Request):
-    generator = await openai_serving_embedding.create_embedding(
-        request, raw_request)
+    generator = await openai_serving_embedding.create_embedding(request, raw_request)
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(),
-                            status_code=generator.code)
+        return JSONResponse(content=generator.model_dump(), status_code=generator.code)
     else:
         return JSONResponse(content=generator.model_dump())
+
+
+import time
+
+
+def parse_body(body: bytes):
+    body = body.decode()
+
+    try:
+        body_json = json.loads(body)
+    except json.JSONDecodeError:
+        body_json = {"raw_body": body}
+    return body_json
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+
+    # Read and log request body
+    request_body = await request.body()
+    request_json = parse_body(request_body)
+    url = str(request.url)
+
+    # Process the request
+    response = await call_next(request)
+
+    # Clone response so we can read and log the body
+    response_body = [chunk async for chunk in response.body_iterator]
+    response_body_bytes = b"".join(response_body)
+    response_json = parse_body(response_body_bytes)
+
+    # Calculate processing time
+    process_time = time.time() - start_time
+
+    information = dict(
+        request=request_json, response=response_json, time=process_time, url=url
+    )
+
+    jasnah.log(target="vllm_api_server", **information)
+
+    # Rebuild response so it can be returned to the client
+    return Response(
+        content=response_body_bytes,
+        status_code=response.status_code,
+        headers=dict(response.headers),
+        media_type=response.media_type,
+    )
 
 
 if __name__ == "__main__":
@@ -157,8 +201,7 @@ if __name__ == "__main__":
             if not request.url.path.startswith(f"{root_path}/v1"):
                 return await call_next(request)
             if request.headers.get("Authorization") != "Bearer " + token:
-                return JSONResponse(content={"error": "Unauthorized"},
-                                    status_code=401)
+                return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
             return await call_next(request)
 
     for middleware in args.middleware:
@@ -169,8 +212,9 @@ if __name__ == "__main__":
         elif inspect.iscoroutinefunction(imported):
             app.middleware("http")(imported)
         else:
-            raise ValueError(f"Invalid middleware {middleware}. "
-                             f"Must be a function or a class.")
+            raise ValueError(
+                f"Invalid middleware {middleware}. " f"Must be a function or a class."
+            )
 
     logger.info("vLLM API server version %s", vllm.__version__)
     logger.info("args: %s", args)
@@ -182,7 +226,8 @@ if __name__ == "__main__":
 
     engine_args = AsyncEngineArgs.from_cli_args(args)
     engine = AsyncLLMEngine.from_engine_args(
-        engine_args, usage_context=UsageContext.OPENAI_API_SERVER)
+        engine_args, usage_context=UsageContext.OPENAI_API_SERVER
+    )
 
     event_loop: Optional[asyncio.AbstractEventLoop]
     try:
@@ -198,22 +243,29 @@ if __name__ == "__main__":
         # When using single vLLM without engine_use_ray
         model_config = asyncio.run(engine.get_model_config())
 
-    openai_serving_chat = OpenAIServingChat(engine, model_config,
-                                            served_model_names,
-                                            args.response_role,
-                                            args.lora_modules,
-                                            args.chat_template)
+    openai_serving_chat = OpenAIServingChat(
+        engine,
+        model_config,
+        served_model_names,
+        args.response_role,
+        args.lora_modules,
+        args.chat_template,
+    )
     openai_serving_completion = OpenAIServingCompletion(
-        engine, model_config, served_model_names, args.lora_modules)
-    openai_serving_embedding = OpenAIServingEmbedding(engine, model_config,
-                                                      served_model_names)
+        engine, model_config, served_model_names, args.lora_modules
+    )
+    openai_serving_embedding = OpenAIServingEmbedding(
+        engine, model_config, served_model_names
+    )
     app.root_path = args.root_path
-    uvicorn.run(app,
-                host=args.host,
-                port=args.port,
-                log_level=args.uvicorn_log_level,
-                timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
-                ssl_keyfile=args.ssl_keyfile,
-                ssl_certfile=args.ssl_certfile,
-                ssl_ca_certs=args.ssl_ca_certs,
-                ssl_cert_reqs=args.ssl_cert_reqs)
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=args.uvicorn_log_level,
+        timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+        ssl_keyfile=args.ssl_keyfile,
+        ssl_certfile=args.ssl_certfile,
+        ssl_ca_certs=args.ssl_ca_certs,
+        ssl_cert_reqs=args.ssl_cert_reqs,
+    )
